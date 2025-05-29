@@ -382,6 +382,17 @@ struct ContentView: View {
         return colorScheme == .light ? Color.primary : Color.white
     }
     
+    // Word count computed property
+    var wordCount: Int {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedText.isEmpty {
+            return 0
+        }
+        return trimmedText.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .count
+    }
+    
     @State private var viewHeight: CGFloat = 0
     
     var body: some View {
@@ -617,6 +628,14 @@ struct ContentView: View {
                                     return event
                                 }
                             }
+                            
+                            Text("•")
+                                .foregroundColor(.gray)
+                            
+                            // Word count display
+                            Text("\(wordCount) words")
+                                .font(.system(size: 13))
+                                .foregroundColor(textColor)
                             
                             Text("•")
                                 .foregroundColor(.gray)
