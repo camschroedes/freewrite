@@ -1,8 +1,8 @@
-# hi, this is freewrite
+# hi, this is brainflush
 
-a simple, open-source mac app to freewrite.
+a simple, open-source mac app for brain dumping and freewriting.
 
-download latest version [here](https://www.freewrite.io/)
+forked from [freewrite](https://github.com/farzaa/freewrite)
 
 ![img](https://i.imgur.com/2ucbtff.gif)
 
