@@ -10,6 +10,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import PDFKit
+import Combine
 
 struct HumanEntry: Identifiable {
     let id: UUID
@@ -73,13 +74,33 @@ struct ChatMessage: Identifiable, Codable {
     }
 }
 
-/// Manages the state and business logic for AI chat interactions
+/// Manages the state and business logic for AI chat interactions with persistent memory
 class ChatManager: ObservableObject {
+    
+    // MARK: - Published Properties
     @Published var messages: [ChatMessage] = []
     @Published var currentInput: String = ""
-    @Published var isLoading: Bool = false
     @Published var selectedProvider: AIProvider = .chatGPT
     @Published var hasInitialResponse: Bool = false
+    @Published var isLoading: Bool = false
+    
+    // MARK: - Private Properties
+    private let apiService: APIService
+    private let conversationId = UUID() // Unique ID for this chat session
+    private weak var parentView: AnyObject? // Weak reference to prevent retain cycles
+    
+    // MARK: - Initialization
+    init(apiService: APIService = APIService()) {
+        self.apiService = apiService
+        loadPersistedConversation()
+        
+        // Observe loading state from APIService
+        apiService.$isLoading
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$isLoading)
+    }
+    
+    // MARK: - Public Methods
     
     /// Adds a new message to the conversation
     func addMessage(_ content: String, isUser: Bool, provider: AIProvider? = nil) {
@@ -96,6 +117,7 @@ class ChatManager: ObservableObject {
     func clearChat() {
         messages.removeAll()
         hasInitialResponse = false
+        apiService.clearConversation(id: conversationId)
     }
     
     /// Sends the initial contextual prompt automatically when chat is first opened
@@ -103,17 +125,23 @@ class ChatManager: ObservableObject {
         guard !hasInitialResponse else { return }
         
         hasInitialResponse = true
-        isLoading = true
         
-        // Create the initial contextual prompt
-        let initialPrompt = createContextualPrompt(
-            userMessage: "Can you give me some feedback on my journal entry?", 
-            journalEntry: context
-        )
-        
-        // Send to AI provider without adding user message to chat
-        Task {
-            await sendToAIProvider(initialPrompt, provider: selectedProvider, isInitialPrompt: true)
+        Task { @MainActor in
+            do {
+                let response = try await apiService.sendMessage(
+                    "Can you give me some feedback on my journal entry?",
+                    provider: selectedProvider,
+                    journalEntry: context,
+                    conversationId: conversationId,
+                    existingMessages: messages
+                )
+                
+                addMessage("Here are my thoughts on your journal entry:", isUser: false, provider: selectedProvider)
+                addMessage(response, isUser: false, provider: selectedProvider)
+                
+            } catch {
+                addMessage("Error: \(error.localizedDescription)", isUser: false, provider: selectedProvider)
+            }
         }
     }
     
@@ -121,244 +149,39 @@ class ChatManager: ObservableObject {
     func sendMessage(withContext context: String) {
         guard !currentInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         
-        // Add user message
-        addMessage(currentInput, isUser: true)
-        
-        // Prepare the full context including journal entry
-        let fullContext = createContextualPrompt(userMessage: currentInput, journalEntry: context)
-        
-        // Clear input and set loading state
+        let userMessage = currentInput
+        addMessage(userMessage, isUser: true)
         currentInput = ""
-        isLoading = true
         
-        // Send to AI provider
-        Task {
-            await sendToAIProvider(fullContext, provider: selectedProvider)
-        }
-    }
-    
-    /// Creates a contextual prompt that includes both the journal entry and user's specific question
-    private func createContextualPrompt(userMessage: String, journalEntry: String) -> String {
-        let basePrompt = """
-        You are an AI assistant helping someone reflect on their journal entry. The user has shared their journal entry and now has a specific question or wants to discuss it further.
-        
-        Be conversational, insightful, and helpful. Respond as a thoughtful friend who truly understands both their writing and their current question.
-        
-        Journal Entry:
-        \(journalEntry.trimmingCharacters(in: .whitespacesAndNewlines))
-        
-        User's Question/Message:
-        \(userMessage)
-        
-        Please respond to their specific question while drawing insights from their journal entry:
-        """
-        
-        return basePrompt
-    }
-    
-    /// Sends the message to the appropriate AI provider's API
-    private func sendToAIProvider(_ message: String, provider: AIProvider, isInitialPrompt: Bool = false) async {
-        // Get API key from UserDefaults
-        guard let apiKey = UserDefaults.standard.string(forKey: provider.keyName),
-              !apiKey.isEmpty else {
-            await MainActor.run {
-                addMessage("Please set up your \(provider.displayName) API key first.", isUser: false, provider: provider)
-                isLoading = false
-            }
-            return
-        }
-        
-        do {
-            let response: String
-            
-            switch provider {
-            case .chatGPT:
-                response = try await callOpenAIAPI(message: message, apiKey: apiKey)
-            case .claude:
-                response = try await callAnthropicAPI(message: message, apiKey: apiKey)
-            }
-            
-            await MainActor.run {
-                if isInitialPrompt {
-                    // For initial prompt, add a contextual introduction
-                    addMessage("Here are my thoughts on your journal entry:", isUser: false, provider: provider)
-                    addMessage(response, isUser: false, provider: provider)
-                } else {
-                    addMessage(response, isUser: false, provider: provider)
-                }
-                isLoading = false
-            }
-        } catch {
-            await MainActor.run {
-                addMessage("Error: \(error.localizedDescription)", isUser: false, provider: provider)
-                isLoading = false
-            }
-        }
-    }
-    
-    /// Calls the OpenAI ChatGPT API
-    private func callOpenAIAPI(message: String, apiKey: String) async throws -> String {
-        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
-            throw APIError.invalidURL
-        }
-        
-        let payload: [String: Any] = [
-            "model": "gpt-4o-mini",
-            "messages": [
-                ["role": "user", "content": message]
-            ],
-            "max_tokens": 2000,
-            "temperature": 0.7
-        ]
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        
-        // Add debugging
-        print("Making request to: \(url)")
-        print("Request headers: \(request.allHTTPHeaderFields ?? [:])")
-        print("API Key prefix: \(String(apiKey.prefix(10)))...")
-        
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            
-            if let httpResponse = response as? HTTPURLResponse {
-                print("Response status code: \(httpResponse.statusCode)")
-                print("Response headers: \(httpResponse.allHeaderFields)")
-            }
-            
-            if let responseString = String(data: data, encoding: .utf8) {
-                print("Response body: \(responseString)")
-            }
-            
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw APIError.requestFailed("No HTTP response received")
-            }
-            
-            guard httpResponse.statusCode == 200 else {
-                // Parse error response for detailed error information
-                if let errorData = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let error = errorData["error"] as? [String: Any],
-                   let message = error["message"] as? String {
-                    
-                    // Handle specific error types
-                    switch httpResponse.statusCode {
-                    case 401:
-                        throw APIError.authenticationError
-                    case 429:
-                        throw APIError.quotaExceeded
-                    case 500...599:
-                        throw APIError.serverError(httpResponse.statusCode)
-                    default:
-                        throw APIError.requestFailed(message)
-                    }
-                } else {
-                    switch httpResponse.statusCode {
-                    case 401:
-                        throw APIError.authenticationError
-                    case 429:
-                        throw APIError.quotaExceeded
-                    case 500...599:
-                        throw APIError.serverError(httpResponse.statusCode)
-                    default:
-                        throw APIError.requestFailed("Request failed with status \(httpResponse.statusCode)")
-                    }
-                }
-            }
-            
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = json["choices"] as? [[String: Any]],
-                  let firstChoice = choices.first,
-                  let message = firstChoice["message"] as? [String: Any],
-                  let content = message["content"] as? String else {
-                throw APIError.invalidResponse
-            }
-            
-            return content.trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            print("Network error: \(error)")
-            print("Error description: \(error.localizedDescription)")
-            throw error
-        }
-    }
-    
-    /// Calls the Anthropic Claude API
-    private func callAnthropicAPI(message: String, apiKey: String) async throws -> String {
-        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
-            throw APIError.invalidURL
-        }
-        
-        let payload: [String: Any] = [
-            "model": "claude-3-haiku-20240307",
-            "max_tokens": 2000,
-            "messages": [
-                ["role": "user", "content": message]
-            ]
-        ]
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        // Add debugging for Claude API
-        if let httpResponse = response as? HTTPURLResponse {
-            print("Claude API Response status: \(httpResponse.statusCode)")
-            if let responseString = String(data: data, encoding: .utf8) {
-                print("Claude API Response: \(responseString)")
-            }
-        }
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw APIError.requestFailed("No HTTP response received")
-        }
-        
-        guard httpResponse.statusCode == 200 else {
-            // Parse error response for detailed error information
-            if let errorData = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let error = errorData["error"] as? [String: Any],
-               let message = error["message"] as? String {
+        Task { @MainActor in
+            do {
+                let response = try await apiService.sendMessage(
+                    userMessage,
+                    provider: selectedProvider,
+                    journalEntry: context,
+                    conversationId: conversationId,
+                    existingMessages: messages
+                )
                 
-                // Handle specific error types
-                switch httpResponse.statusCode {
-                case 401:
-                    throw APIError.authenticationError
-                case 429:
-                    throw APIError.quotaExceeded
-                case 500...599:
-                    throw APIError.serverError(httpResponse.statusCode)
-                default:
-                    throw APIError.requestFailed(message)
-                }
-            } else {
-                switch httpResponse.statusCode {
-                case 401:
-                    throw APIError.authenticationError
-                case 429:
-                    throw APIError.quotaExceeded
-                case 500...599:
-                    throw APIError.serverError(httpResponse.statusCode)
-                default:
-                    throw APIError.requestFailed("Request failed with status \(httpResponse.statusCode)")
-                }
+                addMessage(response, isUser: false, provider: selectedProvider)
+                
+            } catch {
+                addMessage("Error: \(error.localizedDescription)", isUser: false, provider: selectedProvider)
             }
         }
-        
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let firstContent = content.first,
-              let text = firstContent["text"] as? String else {
-            throw APIError.invalidResponse
+    }
+}
+
+// MARK: - Private Methods
+private extension ChatManager {
+    
+    func loadPersistedConversation() {
+        // Load previous conversation on app launch
+        let persistedMessages = apiService.getConversationHistory(id: conversationId)
+        if !persistedMessages.isEmpty {
+            messages = persistedMessages
+            hasInitialResponse = persistedMessages.contains { !$0.isUser }
         }
-        
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
