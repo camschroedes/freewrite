@@ -44,20 +44,16 @@ struct HeartEmoji: Identifiable {
     var offset: CGFloat = 0
 }
 
-/// Represents different AI providers available for chat
+/// Represents the AI provider for chat (ChatGPT only)
 enum AIProvider: String, CaseIterable, Codable {
     case chatGPT = "ChatGPT"
-    case claude = "Claude"
     
     var displayName: String {
         return self.rawValue
     }
     
     var keyName: String {
-        switch self {
-        case .chatGPT: return "OpenAI_API_Key"
-        case .claude: return "Anthropic_API_Key"
-        }
+        return "OpenAI_API_Key"
     }
 }
 
@@ -80,7 +76,7 @@ class ChatManager: ObservableObject {
     // MARK: - Published Properties
     @Published var messages: [ChatMessage] = []
     @Published var currentInput: String = ""
-    @Published var selectedProvider: AIProvider = .chatGPT
+
     @Published var hasInitialResponse: Bool = false
     @Published var isLoading: Bool = false
     
@@ -127,21 +123,21 @@ class ChatManager: ObservableObject {
         hasInitialResponse = true
         
         Task { @MainActor in
-            do {
-                let response = try await apiService.sendMessage(
-                    "Can you give me some feedback on my journal entry?",
-                    provider: selectedProvider,
-                    journalEntry: context,
-                    conversationId: conversationId,
-                    existingMessages: messages
-                )
-                
-                addMessage("Here are my thoughts on your journal entry:", isUser: false, provider: selectedProvider)
-                addMessage(response, isUser: false, provider: selectedProvider)
-                
-            } catch {
-                addMessage("Error: \(error.localizedDescription)", isUser: false, provider: selectedProvider)
-            }
+                            do {
+                    let response = try await apiService.sendMessage(
+                        "Can you give me some feedback on my journal entry?",
+                        provider: .chatGPT,
+                        journalEntry: context,
+                        conversationId: conversationId,
+                        existingMessages: messages
+                    )
+                    
+                    addMessage("Here are my thoughts on your journal entry:", isUser: false, provider: .chatGPT)
+                    addMessage(response, isUser: false, provider: .chatGPT)
+                    
+                } catch {
+                    addMessage("Error: \(error.localizedDescription)", isUser: false, provider: .chatGPT)
+                }
         }
     }
     
@@ -157,16 +153,16 @@ class ChatManager: ObservableObject {
             do {
                 let response = try await apiService.sendMessage(
                     userMessage,
-                    provider: selectedProvider,
+                    provider: .chatGPT,
                     journalEntry: context,
                     conversationId: conversationId,
                     existingMessages: messages
                 )
                 
-                addMessage(response, isUser: false, provider: selectedProvider)
+                addMessage(response, isUser: false, provider: .chatGPT)
                 
             } catch {
-                addMessage("Error: \(error.localizedDescription)", isUser: false, provider: selectedProvider)
+                addMessage("Error: \(error.localizedDescription)", isUser: false, provider: .chatGPT)
             }
         }
     }
@@ -211,6 +207,105 @@ enum APIError: LocalizedError {
             return "API quota exceeded. Please check your account limits."
         case .serverError(let statusCode):
             return "Server error (\(statusCode)). Please try again later."
+        }
+    }
+}
+
+/// A dynamic text editor that properly handles height adjustment based on content
+struct DynamicTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var dynamicHeight: CGFloat
+    let font: NSFont
+    let placeholder: String
+    let colorScheme: ColorScheme
+    let onSubmit: (() -> Void)?
+    
+    init(text: Binding<String>, dynamicHeight: Binding<CGFloat>, font: NSFont, placeholder: String, colorScheme: ColorScheme, onSubmit: (() -> Void)? = nil) {
+        self._text = text
+        self._dynamicHeight = dynamicHeight
+        self.font = font
+        self.placeholder = placeholder
+        self.colorScheme = colorScheme
+        self.onSubmit = onSubmit
+    }
+    
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = NSTextView()
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.font = font
+        textView.delegate = context.coordinator
+        textView.textContainerInset = NSSize(width: 12, height: 10)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.backgroundColor = .clear
+        textView.textColor = colorScheme == .light ? NSColor.labelColor : NSColor.white
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.usesFontPanel = false
+        textView.usesRuler = false
+        textView.isSelectable = true
+        textView.isEditable = true
+        return textView
+    }
+    
+    func updateNSView(_ nsView: NSTextView, context: Context) {
+        if nsView.string != text {
+            nsView.string = text
+        }
+        nsView.textColor = colorScheme == .light ? NSColor.labelColor : NSColor.white
+        recalculateHeight(view: nsView)
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, height: $dynamicHeight, onSubmit: onSubmit)
+    }
+    
+    private func recalculateHeight(view: NSTextView) {
+        guard let container = view.textContainer, let manager = view.layoutManager else { return }
+        
+        manager.ensureLayout(for: container)
+        let usedRect = manager.usedRect(for: container)
+        let newHeight = max(36, min(usedRect.height + 20, 120)) // 20 for padding
+        
+        DispatchQueue.main.async {
+            if abs(dynamicHeight - newHeight) > 1 {
+                dynamicHeight = newHeight
+            }
+        }
+    }
+    
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var text: Binding<String>
+        var height: Binding<CGFloat>
+        var onSubmit: (() -> Void)?
+        
+        init(text: Binding<String>, height: Binding<CGFloat>, onSubmit: (() -> Void)? = nil) {
+            self.text = text
+            self.height = height
+            self.onSubmit = onSubmit
+        }
+        
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            text.wrappedValue = textView.string
+            
+            guard let container = textView.textContainer, let manager = textView.layoutManager else { return }
+            manager.ensureLayout(for: container)
+            let usedRect = manager.usedRect(for: container)
+            let newHeight = max(36, min(usedRect.height + 20, 120))
+            
+            DispatchQueue.main.async {
+                self.height.wrappedValue = newHeight
+            }
+        }
+        
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                onSubmit?()
+                return true
+            }
+            return false
         }
     }
 }
@@ -330,17 +425,7 @@ struct ContentView: View {
     my entry:
     """
     
-    private let claudePrompt = """
-    Take a look at my journal entry below. I'd like you to analyze it and respond with deep insight that feels personal, not clinical.
-    Imagine you're not just a friend, but a mentor who truly gets both my tech background and my psychological patterns. I want you to uncover the deeper meaning and emotional undercurrents behind my scattered thoughts.
-    Keep it casual, dont say yo, help me make new connections i don't see, comfort, validate, challenge, all of it. dont be afraid to say a lot. format with markdown headings if needed.
-    Use vivid metaphors and powerful imagery to help me see what I'm really building. Organize your thoughts with meaningful headings that create a narrative journey through my ideas.
-    Don't just validate my thoughts - reframe them in a way that shows me what I'm really seeking beneath the surface. Go beyond the product concepts to the emotional core of what I'm trying to solve.
-    Be willing to be profound and philosophical without sounding like you're giving therapy. I want someone who can see the patterns I can't see myself and articulate them in a way that feels like an epiphany.
-    Start with 'hey, thanks for showing me this. my thoughts:' and then use markdown headings to structure your response.
 
-    Here's my journal entry:
-    """
     
     // Initialize with saved theme preference if available
     init() {
@@ -1169,7 +1254,7 @@ struct ContentView: View {
             loadExistingEntries()
         }
     }
-        .onChange(of: text) { _ in
+        .onChange(of: text) {
             // Save current entry when text changes
             if let currentId = selectedEntryId,
                let currentEntry = entries.first(where: { $0.id == currentId }) {
@@ -1289,15 +1374,7 @@ struct ContentView: View {
         }
     }
     
-    private func openClaude() {
-        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fullText = claudePrompt + "\n\n" + trimmedText
-        
-        if let encodedText = fullText.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-           let url = URL(string: "https://claude.ai/new?q=" + encodedText) {
-            NSWorkspace.shared.open(url)
-        }
-    }
+
 
     private func copyPromptToClipboard() {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1550,32 +1627,18 @@ struct ChatSidebarView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // Header with provider selector and close button
+            // Header with close button
             HStack {
-                Text("AI Chat")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(colorScheme == .light ? .primary : .white)
-                
                 Spacer()
                 
-                // Provider Selector
-                Picker("AI Provider", selection: $chatManager.selectedProvider) {
-                    ForEach(AIProvider.allCases, id: \.self) { provider in
-                        Text(provider.displayName)
-                            .tag(provider)
-                    }
-                }
-                .pickerStyle(MenuPickerStyle())
-                .frame(maxWidth: 120)
-                .accentColor(colorScheme == .light ? .primary : .white)
-                
                 Button(action: onClose) {
-                    Image(systemName: "xmark")
+                    Text("close")
                         .font(.system(size: 14, weight: .medium))
                         .foregroundColor(colorScheme == .light ? .secondary : .secondary.opacity(0.8))
-                        .frame(width: 24, height: 24)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
                         .background(
-                            Circle()
+                            RoundedRectangle(cornerRadius: 4)
                                 .fill(colorScheme == .light ? 
                                      Color.black.opacity(0.05) : 
                                      Color.white.opacity(0.1))
@@ -1590,13 +1653,11 @@ struct ChatSidebarView: View {
                     }
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 16)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
             .background(colorScheme == .light ? 
                        Color(.controlBackgroundColor) : 
                        Color(.controlBackgroundColor).opacity(0.5))
-            
-            Divider()
             
             // Chat Messages Area
             ScrollViewReader { proxy in
@@ -1614,9 +1675,9 @@ struct ChatSidebarView: View {
                                     .foregroundColor(colorScheme == .light ? .secondary : .gray)
                                     .fixedSize(horizontal: false, vertical: true)
                                 
-                                if !hasAPIKey(for: chatManager.selectedProvider) {
-                                    Button("Set up \(chatManager.selectedProvider.displayName) API Key") {
-                                        onAPIKeySetup(chatManager.selectedProvider)
+                                if !hasAPIKey(for: .chatGPT) {
+                                    Button("Set up ChatGPT API Key") {
+                                        onAPIKeySetup(.chatGPT)
                                     }
                                     .buttonStyle(.borderedProminent)
                                     .padding(.top, 8)
@@ -1652,7 +1713,7 @@ struct ChatSidebarView: View {
                     }
                     .padding(.vertical, 8)
                 }
-                .onChange(of: chatManager.messages.count) { _ in
+                .onChange(of: chatManager.messages.count) {
                     // Auto-scroll to bottom when new message arrives
                     if let lastMessage = chatManager.messages.last {
                         withAnimation(.easeOut(duration: 0.3)) {
@@ -1660,7 +1721,7 @@ struct ChatSidebarView: View {
                         }
                     }
                 }
-                .onChange(of: chatManager.isLoading) { isLoading in
+                .onChange(of: chatManager.isLoading) { _, isLoading in
                     if isLoading {
                         withAnimation(.easeOut(duration: 0.3)) {
                             proxy.scrollTo("loading", anchor: .bottom)
@@ -1707,23 +1768,17 @@ struct ChatSidebarView: View {
                                                Color.white.opacity(0.2), lineWidth: 1)
                                 )
                             
-                            // Text editor with proper styling
-                            TextEditor(text: $chatManager.currentInput)
-                                .font(.system(size: 14))
-                                .foregroundColor(colorScheme == .light ? .primary : .white)
-                                .scrollContentBackground(.hidden)
-                                .background(Color.clear)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 10)
-                                .frame(height: inputHeight)
-                                .onChange(of: chatManager.currentInput) { _ in
-                                    withAnimation(.easeInOut(duration: 0.15)) {
-                                        inputHeight = calculateTextHeight()
-                                    }
-                                }
-                                .onSubmit {
-                                    sendMessage()
-                                }
+                            // Dynamic text editor with proper sizing
+                            DynamicTextEditor(
+                                text: $chatManager.currentInput,
+                                dynamicHeight: $inputHeight,
+                                font: NSFont.systemFont(ofSize: 14),
+                                placeholder: "Ask about your journal entry...",
+                                colorScheme: colorScheme,
+                                onSubmit: sendMessage
+                            )
+                            .frame(height: inputHeight)
+                            .background(Color.clear)
                             
                             // Placeholder text
                             if chatManager.currentInput.isEmpty {
@@ -1772,20 +1827,11 @@ struct ChatSidebarView: View {
         }
         .background(colorScheme == .light ? Color.white : Color.black)
         .onAppear {
-            // Check if API key is available for the selected provider
-            if !hasAPIKey(for: chatManager.selectedProvider) {
-                onAPIKeySetup(chatManager.selectedProvider)
+            // Check if API key is available for ChatGPT
+            if !hasAPIKey(for: .chatGPT) {
+                onAPIKeySetup(.chatGPT)
             } else if !chatManager.hasInitialResponse && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 // Automatically send initial prompt if we have API key and journal content
-                chatManager.sendInitialPrompt(withContext: text)
-            }
-        }
-        .onChange(of: chatManager.selectedProvider) { provider in
-            // Check API key when provider changes
-            if !hasAPIKey(for: provider) {
-                onAPIKeySetup(provider)
-            } else if !chatManager.hasInitialResponse && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // Send initial prompt if we have API key and haven't sent it yet
                 chatManager.sendInitialPrompt(withContext: text)
             }
         }
@@ -1801,7 +1847,7 @@ struct ChatSidebarView: View {
     private var canSendMessage: Bool {
         return !chatManager.currentInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty 
             && !chatManager.isLoading 
-            && hasAPIKey(for: chatManager.selectedProvider)
+            && hasAPIKey(for: .chatGPT)
     }
     
     /// Sends the current message to the AI provider
@@ -1810,20 +1856,7 @@ struct ChatSidebarView: View {
         chatManager.sendMessage(withContext: text)
     }
     
-    /// Calculates the dynamic height needed for the text input based on content
-    private func calculateTextHeight() -> CGFloat {
-        let font = NSFont.systemFont(ofSize: 14)
-        let lineHeight = font.ascender - font.descender + font.leading
-        
-        // Count the number of lines in the current input
-        let lineCount = max(1, chatManager.currentInput.components(separatedBy: .newlines).count)
-        
-        // Calculate height: base padding (16) + (line count * line height)
-        let calculatedHeight = 16 + (CGFloat(lineCount) * lineHeight)
-        
-        // Ensure minimum height of 36 and maximum of 120
-        return max(36, min(calculatedHeight, 120))
-    }
+
 
 }
 
@@ -1853,15 +1886,13 @@ struct ChatMessageView: View {
             } else {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 4) {
-                        if let provider = message.provider {
-                            Text(provider.displayName)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.2))
-                                .cornerRadius(4)
-                        }
+                        Text("ChatGPT")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.2))
+                            .cornerRadius(4)
                         
                         Text(formatTime(message.timestamp))
                             .font(.caption2)
@@ -1946,12 +1977,7 @@ struct APIKeySetupView: View {
                         .font(.subheadline)
                         .fontWeight(.semibold)
                     
-                    switch provider {
-                    case .chatGPT:
-                        Text("1. Visit platform.openai.com\n2. Sign in or create an account\n3. Go to API Keys section\n4. Create a new API key\n5. Copy and paste it here")
-                    case .claude:
-                        Text("1. Visit console.anthropic.com\n2. Sign in or create an account\n3. Go to API Keys section\n4. Create a new API key\n5. Copy and paste it here")
-                    }
+                    Text("1. Visit platform.openai.com\n2. Sign in or create an account\n3. Go to API Keys section\n4. Create a new API key\n5. Copy and paste it here")
                     
                     Text("Note: Your API key is stored locally and never shared.")
                         .font(.caption)

@@ -76,13 +76,7 @@ class APIService: ObservableObject {
         )
         
         // Make API call
-        let response: String
-        switch provider {
-        case .chatGPT:
-            response = try await callOpenAIAPI(message: contextualPrompt, apiKey: apiKey)
-        case .claude:
-            response = try await callAnthropicAPI(message: contextualPrompt, apiKey: apiKey)
-        }
+        let response = try await callOpenAIAPI(message: contextualPrompt, apiKey: apiKey)
         
         // Update conversation context with new messages (using weak references pattern)
         let userMessage = ChatMessage(content: message, isUser: true, timestamp: Date(), provider: provider)
@@ -241,78 +235,5 @@ private extension APIService {
         }
     }
     
-    func callAnthropicAPI(message: String, apiKey: String) async throws -> String {
-        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
-            throw APIError.invalidURL
-        }
-        
-        let payload: [String: Any] = [
-            "model": "claude-3-haiku-20240307",
-            "max_tokens": Constants.maxTokensPerRequest,
-            "messages": [
-                ["role": "user", "content": message]
-            ]
-        ]
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        
-        let (data, response) = try await urlSession.data(for: request)
-        
-        // Add debugging for Claude API
-        if let httpResponse = response as? HTTPURLResponse {
-            print("Claude API Response status: \(httpResponse.statusCode)")
-            if let responseString = String(data: data, encoding: .utf8) {
-                print("Claude API Response: \(responseString)")
-            }
-        }
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw APIError.requestFailed("No HTTP response received")
-        }
-        
-        guard httpResponse.statusCode == 200 else {
-            // Parse error response for detailed error information
-            if let errorData = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let error = errorData["error"] as? [String: Any],
-               let message = error["message"] as? String {
-                
-                // Handle specific error types
-                switch httpResponse.statusCode {
-                case 401:
-                    throw APIError.authenticationError
-                case 429:
-                    throw APIError.quotaExceeded
-                case 500...599:
-                    throw APIError.serverError(httpResponse.statusCode)
-                default:
-                    throw APIError.requestFailed(message)
-                }
-            } else {
-                switch httpResponse.statusCode {
-                case 401:
-                    throw APIError.authenticationError
-                case 429:
-                    throw APIError.quotaExceeded
-                case 500...599:
-                    throw APIError.serverError(httpResponse.statusCode)
-                default:
-                    throw APIError.requestFailed("Request failed with status \(httpResponse.statusCode)")
-                }
-            }
-        }
-        
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let firstContent = content.first,
-              let text = firstContent["text"] as? String else {
-            throw APIError.invalidResponse
-        }
-        
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
+
 } 
