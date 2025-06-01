@@ -43,6 +43,329 @@ struct HeartEmoji: Identifiable {
     var offset: CGFloat = 0
 }
 
+/// Represents different AI providers available for chat
+enum AIProvider: String, CaseIterable, Codable {
+    case chatGPT = "ChatGPT"
+    case claude = "Claude"
+    
+    var displayName: String {
+        return self.rawValue
+    }
+    
+    var keyName: String {
+        switch self {
+        case .chatGPT: return "OpenAI_API_Key"
+        case .claude: return "Anthropic_API_Key"
+        }
+    }
+}
+
+/// Represents a single message in the chat conversation
+struct ChatMessage: Identifiable, Codable {
+    let id = UUID()
+    let content: String
+    let isUser: Bool
+    let timestamp: Date
+    let provider: AIProvider?
+    
+    enum CodingKeys: String, CodingKey {
+        case content, isUser, timestamp, provider
+    }
+}
+
+/// Manages the state and business logic for AI chat interactions
+class ChatManager: ObservableObject {
+    @Published var messages: [ChatMessage] = []
+    @Published var currentInput: String = ""
+    @Published var isLoading: Bool = false
+    @Published var selectedProvider: AIProvider = .chatGPT
+    
+    /// Adds a new message to the conversation
+    func addMessage(_ content: String, isUser: Bool, provider: AIProvider? = nil) {
+        let message = ChatMessage(
+            content: content,
+            isUser: isUser,
+            timestamp: Date(),
+            provider: provider
+        )
+        messages.append(message)
+    }
+    
+    /// Clears all messages from the conversation
+    func clearChat() {
+        messages.removeAll()
+    }
+    
+    /// Sends a message to the selected AI provider
+    func sendMessage(withContext context: String) {
+        guard !currentInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        
+        // Add user message
+        addMessage(currentInput, isUser: true)
+        
+        // Prepare the full context including journal entry
+        let fullContext = createContextualPrompt(userMessage: currentInput, journalEntry: context)
+        
+        // Clear input and set loading state
+        let messageToSend = currentInput
+        currentInput = ""
+        isLoading = true
+        
+        // Send to AI provider
+        Task {
+            await sendToAIProvider(fullContext, provider: selectedProvider)
+        }
+    }
+    
+    /// Creates a contextual prompt that includes both the journal entry and user's specific question
+    private func createContextualPrompt(userMessage: String, journalEntry: String) -> String {
+        let basePrompt = """
+        You are an AI assistant helping someone reflect on their journal entry. The user has shared their journal entry and now has a specific question or wants to discuss it further.
+        
+        Be conversational, insightful, and helpful. Respond as a thoughtful friend who truly understands both their writing and their current question.
+        
+        Journal Entry:
+        \(journalEntry.trimmingCharacters(in: .whitespacesAndNewlines))
+        
+        User's Question/Message:
+        \(userMessage)
+        
+        Please respond to their specific question while drawing insights from their journal entry:
+        """
+        
+        return basePrompt
+    }
+    
+    /// Sends the message to the appropriate AI provider's API
+    private func sendToAIProvider(_ message: String, provider: AIProvider) async {
+        // Get API key from UserDefaults
+        guard let apiKey = UserDefaults.standard.string(forKey: provider.keyName),
+              !apiKey.isEmpty else {
+            await MainActor.run {
+                addMessage("Please set up your \(provider.displayName) API key first.", isUser: false, provider: provider)
+                isLoading = false
+            }
+            return
+        }
+        
+        do {
+            let response: String
+            
+            switch provider {
+            case .chatGPT:
+                response = try await callOpenAIAPI(message: message, apiKey: apiKey)
+            case .claude:
+                response = try await callAnthropicAPI(message: message, apiKey: apiKey)
+            }
+            
+            await MainActor.run {
+                addMessage(response, isUser: false, provider: provider)
+                isLoading = false
+            }
+        } catch {
+            await MainActor.run {
+                addMessage("Error: \(error.localizedDescription)", isUser: false, provider: provider)
+                isLoading = false
+            }
+        }
+    }
+    
+    /// Calls the OpenAI ChatGPT API
+    private func callOpenAIAPI(message: String, apiKey: String) async throws -> String {
+        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
+            throw APIError.invalidURL
+        }
+        
+        let payload: [String: Any] = [
+            "model": "gpt-4o-mini",
+            "messages": [
+                ["role": "user", "content": message]
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.7
+        ]
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        
+        // Add debugging
+        print("Making request to: \(url)")
+        print("Request headers: \(request.allHTTPHeaderFields ?? [:])")
+        print("API Key prefix: \(String(apiKey.prefix(10)))...")
+        
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            if let httpResponse = response as? HTTPURLResponse {
+                print("Response status code: \(httpResponse.statusCode)")
+                print("Response headers: \(httpResponse.allHeaderFields)")
+            }
+            
+            if let responseString = String(data: data, encoding: .utf8) {
+                print("Response body: \(responseString)")
+            }
+            
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw APIError.requestFailed("No HTTP response received")
+            }
+            
+            guard httpResponse.statusCode == 200 else {
+                // Parse error response for detailed error information
+                if let errorData = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let error = errorData["error"] as? [String: Any],
+                   let message = error["message"] as? String {
+                    
+                    // Handle specific error types
+                    switch httpResponse.statusCode {
+                    case 401:
+                        throw APIError.authenticationError
+                    case 429:
+                        throw APIError.quotaExceeded
+                    case 500...599:
+                        throw APIError.serverError(httpResponse.statusCode)
+                    default:
+                        throw APIError.requestFailed(message)
+                    }
+                } else {
+                    switch httpResponse.statusCode {
+                    case 401:
+                        throw APIError.authenticationError
+                    case 429:
+                        throw APIError.quotaExceeded
+                    case 500...599:
+                        throw APIError.serverError(httpResponse.statusCode)
+                    default:
+                        throw APIError.requestFailed("Request failed with status \(httpResponse.statusCode)")
+                    }
+                }
+            }
+            
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let firstChoice = choices.first,
+                  let message = firstChoice["message"] as? [String: Any],
+                  let content = message["content"] as? String else {
+                throw APIError.invalidResponse
+            }
+            
+            return content.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            print("Network error: \(error)")
+            print("Error description: \(error.localizedDescription)")
+            throw error
+        }
+    }
+    
+    /// Calls the Anthropic Claude API
+    private func callAnthropicAPI(message: String, apiKey: String) async throws -> String {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            throw APIError.invalidURL
+        }
+        
+        let payload: [String: Any] = [
+            "model": "claude-3-haiku-20240307",
+            "max_tokens": 2000,
+            "messages": [
+                ["role": "user", "content": message]
+            ]
+        ]
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        // Add debugging for Claude API
+        if let httpResponse = response as? HTTPURLResponse {
+            print("Claude API Response status: \(httpResponse.statusCode)")
+            if let responseString = String(data: data, encoding: .utf8) {
+                print("Claude API Response: \(responseString)")
+            }
+        }
+        
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.requestFailed("No HTTP response received")
+        }
+        
+        guard httpResponse.statusCode == 200 else {
+            // Parse error response for detailed error information
+            if let errorData = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let error = errorData["error"] as? [String: Any],
+               let message = error["message"] as? String {
+                
+                // Handle specific error types
+                switch httpResponse.statusCode {
+                case 401:
+                    throw APIError.authenticationError
+                case 429:
+                    throw APIError.quotaExceeded
+                case 500...599:
+                    throw APIError.serverError(httpResponse.statusCode)
+                default:
+                    throw APIError.requestFailed(message)
+                }
+            } else {
+                switch httpResponse.statusCode {
+                case 401:
+                    throw APIError.authenticationError
+                case 429:
+                    throw APIError.quotaExceeded
+                case 500...599:
+                    throw APIError.serverError(httpResponse.statusCode)
+                default:
+                    throw APIError.requestFailed("Request failed with status \(httpResponse.statusCode)")
+                }
+            }
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]],
+              let firstContent = content.first,
+              let text = firstContent["text"] as? String else {
+            throw APIError.invalidResponse
+        }
+        
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Custom errors for API interactions
+enum APIError: LocalizedError {
+    case invalidURL
+    case requestFailed(String?)
+    case invalidResponse
+    case networkError(Error)
+    case authenticationError
+    case quotaExceeded
+    case serverError(Int)
+    
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            return "Invalid API URL"
+        case .requestFailed(let message):
+            return message ?? "API request failed"
+        case .invalidResponse:
+            return "Invalid API response format"
+        case .networkError(let error):
+            return "Network error: \(error.localizedDescription)"
+        case .authenticationError:
+            return "Authentication failed. Please check your API key."
+        case .quotaExceeded:
+            return "API quota exceeded. Please check your account limits."
+        case .serverError(let statusCode):
+            return "Server error (\(statusCode)). Please try again later."
+        }
+    }
+}
+
 struct ContentView: View {
     private let headerString = "\n\n"
     @State private var entries: [HumanEntry] = []
@@ -85,6 +408,26 @@ struct ContentView: View {
     @State private var colorScheme: ColorScheme = .light // Add state for color scheme
     @State private var isHoveringThemeToggle = false // Add state for theme toggle hover
     @State private var didCopyPrompt: Bool = false // Add state for copy prompt feedback
+    
+    // MARK: - Chat-related State Variables
+    /// Controls whether the chat sidebar is currently visible
+    @State private var showingChatSidebar = false
+    
+    /// Manages all chat-related state and business logic
+    @StateObject private var chatManager = ChatManager()
+    
+    /// Controls the API key setup modal visibility
+    @State private var showingAPIKeySetup = false
+    
+    /// Tracks which provider needs API key setup
+    @State private var providerNeedingSetup: AIProvider? = nil
+    
+    /// Width of the chat sidebar (1/3 of screen width)
+    @State private var chatSidebarWidth: CGFloat = 400
+    
+    /// Controls the smooth animation when toggling chat sidebar
+    @State private var sidebarAnimationOffset: CGFloat = 0
+    
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     let entryHeight: CGFloat = 40
     
@@ -401,9 +744,11 @@ struct ContentView: View {
         let textColor = colorScheme == .light ? Color.gray : Color.gray.opacity(0.8)
         let textHoverColor = colorScheme == .light ? Color.black : Color.white
         
-        HStack(spacing: 0) {
-            // Main content
-            ZStack {
+        // Get the current screen width to calculate 1/3 for chat sidebar
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                // Main content area - takes up remaining space when chat is open
+                ZStack {
                 Color(colorScheme == .light ? .white : .black)
                     .ignoresSafeArea()
                 
@@ -641,9 +986,21 @@ struct ContentView: View {
                                 .foregroundColor(.gray)
                             
                             Button("Chat") {
-                                showingChatMenu = true
-                                // Ensure didCopyPrompt is reset when opening the menu
-                                didCopyPrompt = false
+                                // Check if minimum writing requirement is met
+                                let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                
+                                if trimmedText.hasPrefix("hi. my name is farza.") {
+                                    // Show brief feedback for the guide text
+                                    return
+                                } else if trimmedText.count < 350 {
+                                    // Show brief feedback for insufficient writing
+                                    return
+                                } else {
+                                    // Toggle the chat sidebar with smooth animation
+                                    withAnimation(.easeInOut(duration: 0.3)) {
+                                        showingChatSidebar.toggle()
+                                    }
+                                }
                             }
                             .buttonStyle(.plain)
                             .foregroundColor(isHoveringChat ? textHoverColor : textColor)
@@ -654,142 +1011,6 @@ struct ContentView: View {
                                     NSCursor.pointingHand.push()
                                 } else {
                                     NSCursor.pop()
-                                }
-                            }
-                            .popover(isPresented: $showingChatMenu, attachmentAnchor: .point(UnitPoint(x: 0.5, y: 0)), arrowEdge: .top) {
-                                VStack(spacing: 0) { // Wrap everything in a VStack for consistent styling and onChange
-                                    let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    
-                                    // Calculate potential URL lengths
-                                    let gptFullText = aiChatPrompt + "\n\n" + trimmedText
-                                    let claudeFullText = claudePrompt + "\n\n" + trimmedText
-                                    let encodedGptText = gptFullText.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-                                    let encodedClaudeText = claudeFullText.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-                                    
-                                    let gptUrlLength = "https://chat.openai.com/?m=".count + encodedGptText.count
-                                    let claudeUrlLength = "https://claude.ai/new?q=".count + encodedClaudeText.count
-                                    let isUrlTooLong = gptUrlLength > 6000 || claudeUrlLength > 6000
-                                    
-                                    if isUrlTooLong {
-                                        // View for long text (URL too long)
-                                        Text("Hey, your entry is long. It'll break the URL. Instead, copy prompt by clicking below and paste into AI of your choice!")
-                                            .font(.system(size: 14))
-                                            .foregroundColor(popoverTextColor)
-                                            .lineLimit(nil)
-                                            .multilineTextAlignment(.leading)
-                                            .frame(width: 200, alignment: .leading)
-                                            .padding(.horizontal, 12)
-                                            .padding(.vertical, 8)
-                                        
-                                        Divider()
-                                        
-                                        Button(action: {
-                                            copyPromptToClipboard()
-                                            didCopyPrompt = true
-                                        }) {
-                                            Text(didCopyPrompt ? "Copied!" : "Copy Prompt")
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 8)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .foregroundColor(popoverTextColor)
-                                        .onHover { hovering in
-                                            if hovering {
-                                                NSCursor.pointingHand.push()
-                                            } else {
-                                                NSCursor.pop()
-                                            }
-                                        }
-                                        
-                                    } else if text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("hi. my name is farza.") {
-                                        Text("Yo. Sorry, you can't chat with the guide lol. Please write your own entry.")
-                                            .font(.system(size: 14))
-                                            .foregroundColor(popoverTextColor)
-                                            .frame(width: 250)
-                                            .padding(.horizontal, 12)
-                                            .padding(.vertical, 8)
-                                    } else if text.count < 350 {
-                                        Text("Please free write for at minimum 5 minutes first. Then click this. Trust.")
-                                            .font(.system(size: 14))
-                                            .foregroundColor(popoverTextColor)
-                                            .frame(width: 250)
-                                            .padding(.horizontal, 12)
-                                            .padding(.vertical, 8)
-                                    } else {
-                                        // View for normal text length
-                                        Button(action: {
-                                            showingChatMenu = false
-                                            openChatGPT()
-                                        }) {
-                                            Text("ChatGPT")
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 8)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .foregroundColor(popoverTextColor)
-                                        .onHover { hovering in
-                                            if hovering {
-                                                NSCursor.pointingHand.push()
-                                            } else {
-                                                NSCursor.pop()
-                                            }
-                                        }
-                                        
-                                        Divider()
-                                        
-                                        Button(action: {
-                                            showingChatMenu = false
-                                            openClaude()
-                                        }) {
-                                            Text("Claude")
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 8)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .foregroundColor(popoverTextColor)
-                                        .onHover { hovering in
-                                            if hovering {
-                                                NSCursor.pointingHand.push()
-                                            } else {
-                                                NSCursor.pop()
-                                            }
-                                        }
-                                        
-                                        Divider()
-                                        
-                                        Button(action: {
-                                            // Don't dismiss menu, just copy and update state
-                                            copyPromptToClipboard()
-                                            didCopyPrompt = true
-                                        }) {
-                                            Text(didCopyPrompt ? "Copied!" : "Copy Prompt")
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 8)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .foregroundColor(popoverTextColor)
-                                        .onHover { hovering in
-                                            if hovering {
-                                                NSCursor.pointingHand.push()
-                                            } else {
-                                                NSCursor.pop()
-                                            }
-                                        }
-                                    }
-                                }
-                                .frame(minWidth: 120, maxWidth: 250) // Allow width to adjust
-                                .background(popoverBackgroundColor)
-                                .cornerRadius(8)
-                                .shadow(color: Color.black.opacity(0.1), radius: 4, y: 2)
-                                // Reset copied state when popover dismisses
-                                .onChange(of: showingChatMenu) { newValue in
-                                    if !newValue {
-                                        didCopyPrompt = false
-                                    }
                                 }
                             }
                             
@@ -1051,14 +1272,44 @@ struct ContentView: View {
                 .frame(width: 200)
                 .background(Color(colorScheme == .light ? .white : NSColor.black))
             }
+            
+            // Chat Sidebar - appears on the left, taking up 1/3 of screen width
+            if showingChatSidebar {
+                ChatSidebarView(
+                    chatManager: chatManager, 
+                    text: text, 
+                    colorScheme: colorScheme,
+                    onClose: {
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            showingChatSidebar = false
+                        }
+                    },
+                    onAPIKeySetup: { provider in
+                        providerNeedingSetup = provider
+                        showingAPIKeySetup = true
+                    }
+                )
+                .frame(width: geometry.size.width / 3)
+                .transition(.move(edge: .leading))
+            }
         }
         .frame(minWidth: 1100, minHeight: 600)
         .animation(.easeInOut(duration: 0.2), value: showingSidebar)
+        .animation(.easeInOut(duration: 0.3), value: showingChatSidebar)
         .preferredColorScheme(colorScheme)
+        .sheet(isPresented: $showingAPIKeySetup) {
+            if let provider = providerNeedingSetup {
+                APIKeySetupView(provider: provider) {
+                    showingAPIKeySetup = false
+                    providerNeedingSetup = nil
+                }
+            }
+        }
         .onAppear {
             showingSidebar = false  // Hide sidebar by default
             loadExistingEntries()
         }
+    }
         .onChange(of: text) { _ in
             // Save current entry when text changes
             if let currentId = selectedEntryId,
@@ -1425,6 +1676,493 @@ extension NSView {
             }
         }
         return nil
+    }
+}
+
+/// A sophisticated chat sidebar that provides seamless AI conversations within the freewrite app
+struct ChatSidebarView: View {
+    @ObservedObject var chatManager: ChatManager
+    let text: String
+    let colorScheme: ColorScheme
+    let onClose: () -> Void
+    let onAPIKeySetup: (AIProvider) -> Void
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header with provider selector and close button
+            HStack {
+                Text("AI Chat")
+                    .font(.headline)
+                    .foregroundColor(colorScheme == .light ? .primary : .white)
+                
+                Spacer()
+                
+                // Provider Selector
+                Picker("AI Provider", selection: $chatManager.selectedProvider) {
+                    ForEach(AIProvider.allCases, id: \.self) { provider in
+                        Text(provider.displayName)
+                            .tag(provider)
+                    }
+                }
+                .pickerStyle(MenuPickerStyle())
+                .frame(maxWidth: 120)
+                
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(colorScheme == .light ? .secondary : .gray)
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(colorScheme == .light ? Color.gray.opacity(0.1) : Color.black.opacity(0.3))
+            
+            Divider()
+            
+            // Chat Messages Area
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        if chatManager.messages.isEmpty {
+                            // Welcome message explaining the feature
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Welcome to AI Chat!")
+                                    .font(.headline)
+                                    .foregroundColor(colorScheme == .light ? .primary : .white)
+                                
+                                Text("Your journal entry has been loaded as context. Ask questions, seek insights, or simply discuss your thoughts with AI.")
+                                    .font(.body)
+                                    .foregroundColor(colorScheme == .light ? .secondary : .gray)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                
+                                                if !hasAPIKey(for: chatManager.selectedProvider) {
+                    Button("Set up \(chatManager.selectedProvider.displayName) API Key") {
+                        onAPIKeySetup(chatManager.selectedProvider)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .padding(.top, 8)
+                } else {
+                    Button("Test API Connection") {
+                        Task {
+                            await testAPIConnection()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 8)
+                }
+                            }
+                            .padding(16)
+                        } else {
+                            ForEach(chatManager.messages) { message in
+                                ChatMessageView(
+                                    message: message,
+                                    colorScheme: colorScheme
+                                )
+                                .id(message.id)
+                            }
+                        }
+                        
+                        // Loading indicator
+                        if chatManager.isLoading {
+                            HStack {
+                                Text("AI is thinking...")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .italic()
+                                
+                                Spacer()
+                                
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                            }
+                            .padding(.horizontal, 16)
+                            .id("loading")
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+                .onChange(of: chatManager.messages.count) { _ in
+                    // Auto-scroll to bottom when new message arrives
+                    if let lastMessage = chatManager.messages.last {
+                        withAnimation(.easeOut(duration: 0.3)) {
+                            proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                        }
+                    }
+                }
+                .onChange(of: chatManager.isLoading) { isLoading in
+                    if isLoading {
+                        withAnimation(.easeOut(duration: 0.3)) {
+                            proxy.scrollTo("loading", anchor: .bottom)
+                        }
+                    }
+                }
+            }
+            
+            Divider()
+            
+            // Input Area
+            VStack(spacing: 8) {
+                // Clear chat button
+                if !chatManager.messages.isEmpty {
+                    HStack {
+                        Button("Clear Chat") {
+                            chatManager.clearChat()
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                        
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                }
+                
+                // Message input field
+                HStack(spacing: 8) {
+                    TextField("Ask about your journal entry...", text: $chatManager.currentInput, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(1...4)
+                        .onSubmit {
+                            sendMessage()
+                        }
+                    
+                    Button(action: sendMessage) {
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 14))
+                            .foregroundColor(canSendMessage ? .accentColor : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canSendMessage)
+                    .onHover { hovering in
+                        if hovering && canSendMessage {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
+            }
+        }
+        .background(colorScheme == .light ? Color.white : Color.black)
+        .onAppear {
+            // Check if API key is available for the selected provider
+            if !hasAPIKey(for: chatManager.selectedProvider) {
+                onAPIKeySetup(chatManager.selectedProvider)
+            }
+        }
+        .onChange(of: chatManager.selectedProvider) { provider in
+            // Check API key when provider changes
+            if !hasAPIKey(for: provider) {
+                onAPIKeySetup(provider)
+            }
+        }
+    }
+    
+    /// Checks if the user has an API key stored for the given provider
+    private func hasAPIKey(for provider: AIProvider) -> Bool {
+        guard let key = UserDefaults.standard.string(forKey: provider.keyName) else { return false }
+        return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    
+    /// Determines if a message can be sent (has content and API key)
+    private var canSendMessage: Bool {
+        return !chatManager.currentInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty 
+            && !chatManager.isLoading 
+            && hasAPIKey(for: chatManager.selectedProvider)
+    }
+    
+    /// Sends the current message to the AI provider
+    private func sendMessage() {
+        guard canSendMessage else { return }
+        chatManager.sendMessage(withContext: text)
+    }
+    
+    /// Tests the API connection with a simple message
+    private func testAPIConnection() async {
+        guard let apiKey = UserDefaults.standard.string(forKey: chatManager.selectedProvider.keyName) else {
+            chatManager.addMessage("No API key found for \(chatManager.selectedProvider.displayName)", isUser: false)
+            return
+        }
+        
+        chatManager.addMessage("Testing API connection...", isUser: true)
+        
+        do {
+            let response: String
+            switch chatManager.selectedProvider {
+            case .chatGPT:
+                response = try await callOpenAIAPITest(apiKey: apiKey)
+            case .claude:
+                response = try await callAnthropicAPITest(apiKey: apiKey)
+            }
+            
+            await MainActor.run {
+                chatManager.addMessage("✅ Connection successful! Response: \(response)", isUser: false, provider: chatManager.selectedProvider)
+            }
+        } catch {
+            await MainActor.run {
+                chatManager.addMessage("❌ Connection failed: \(error.localizedDescription)", isUser: false, provider: chatManager.selectedProvider)
+            }
+        }
+    }
+    
+    /// Simple test call to OpenAI API
+    private func callOpenAIAPITest(apiKey: String) async throws -> String {
+        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
+            throw APIError.invalidURL
+        }
+        
+        let payload: [String: Any] = [
+            "model": "gpt-4o-mini",
+            "messages": [
+                ["role": "user", "content": "Hello! Just testing the connection. Please respond with 'Connection successful!'"]
+            ],
+            "max_tokens": 50,
+            "temperature": 0.7
+        ]
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.requestFailed("No HTTP response received")
+        }
+        
+        guard httpResponse.statusCode == 200 else {
+            throw APIError.requestFailed("HTTP \(httpResponse.statusCode)")
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = json["choices"] as? [[String: Any]],
+              let firstChoice = choices.first,
+              let message = firstChoice["message"] as? [String: Any],
+              let content = message["content"] as? String else {
+            throw APIError.invalidResponse
+        }
+        
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    /// Simple test call to Anthropic API
+    private func callAnthropicAPITest(apiKey: String) async throws -> String {
+        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
+            throw APIError.invalidURL
+        }
+        
+        let payload: [String: Any] = [
+            "model": "claude-3-haiku-20240307",
+            "max_tokens": 50,
+            "messages": [
+                ["role": "user", "content": "Hello! Just testing the connection. Please respond with 'Connection successful!'"]
+            ]
+        ]
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.requestFailed("No HTTP response received")
+        }
+        
+        guard httpResponse.statusCode == 200 else {
+            throw APIError.requestFailed("HTTP \(httpResponse.statusCode)")
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]],
+              let firstContent = content.first,
+              let text = firstContent["text"] as? String else {
+            throw APIError.invalidResponse
+        }
+        
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Displays individual chat messages with appropriate styling
+struct ChatMessageView: View {
+    let message: ChatMessage
+    let colorScheme: ColorScheme
+    
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            if message.isUser {
+                Spacer()
+                
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(message.content)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.accentColor)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+                        .frame(maxWidth: .infinity * 0.8, alignment: .trailing)
+                    
+                    Text(formatTime(message.timestamp))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        if let provider = message.provider {
+                            Text(provider.displayName)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.secondary.opacity(0.2))
+                                .cornerRadius(4)
+                        }
+                        
+                        Text(formatTime(message.timestamp))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Text(message.content)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(colorScheme == .light ? Color.gray.opacity(0.15) : Color.white.opacity(0.15))
+                        .foregroundColor(colorScheme == .light ? .primary : .white)
+                        .cornerRadius(12)
+                        .frame(maxWidth: .infinity * 0.8, alignment: .leading)
+                        .textSelection(.enabled) // Allow text selection for AI responses
+                }
+                
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+    
+    /// Formats timestamp for display
+    private func formatTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
+/// Modal view for setting up API keys for AI providers
+struct APIKeySetupView: View {
+    let provider: AIProvider
+    let onComplete: () -> Void
+    
+    @State private var apiKey: String = ""
+    @State private var showingInstructions = false
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            // Header
+            VStack(spacing: 8) {
+                Image(systemName: "key.fill")
+                    .font(.system(size: 40))
+                    .foregroundColor(.accentColor)
+                
+                Text("Set up \(provider.displayName) API Key")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                
+                Text("To use \(provider.displayName), you'll need to provide your API key.")
+                    .font(.body)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            
+            // API Key input
+            VStack(alignment: .leading, spacing: 8) {
+                Text("API Key")
+                    .font(.headline)
+                
+                SecureField("Enter your \(provider.displayName) API key", text: $apiKey)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        saveAPIKey()
+                    }
+                
+                Button("Where do I get this?") {
+                    showingInstructions.toggle()
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.accentColor)
+                .font(.caption)
+            }
+            
+            // Instructions (expandable)
+            if showingInstructions {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("How to get your \(provider.displayName) API key:")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    
+                    switch provider {
+                    case .chatGPT:
+                        Text("1. Visit platform.openai.com\n2. Sign in or create an account\n3. Go to API Keys section\n4. Create a new API key\n5. Copy and paste it here")
+                    case .claude:
+                        Text("1. Visit console.anthropic.com\n2. Sign in or create an account\n3. Go to API Keys section\n4. Create a new API key\n5. Copy and paste it here")
+                    }
+                    
+                    Text("Note: Your API key is stored locally and never shared.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .italic()
+                }
+                .padding()
+                .background(Color.secondary.opacity(0.1))
+                .cornerRadius(8)
+            }
+            
+            // Buttons
+            HStack(spacing: 12) {
+                Button("Cancel") {
+                    onComplete()
+                }
+                .buttonStyle(.plain)
+                
+                Button("Save") {
+                    saveAPIKey()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 400)
+        .onAppear {
+            // Load existing API key if available
+            apiKey = UserDefaults.standard.string(forKey: provider.keyName) ?? ""
+        }
+    }
+    
+    /// Saves the API key to UserDefaults and closes the modal
+    private func saveAPIKey() {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else { return }
+        
+        UserDefaults.standard.set(trimmedKey, forKey: provider.keyName)
+        onComplete()
     }
 }
 
