@@ -79,6 +79,7 @@ class ChatManager: ObservableObject {
     @Published var currentInput: String = ""
     @Published var isLoading: Bool = false
     @Published var selectedProvider: AIProvider = .chatGPT
+    @Published var hasInitialResponse: Bool = false
     
     /// Adds a new message to the conversation
     func addMessage(_ content: String, isUser: Bool, provider: AIProvider? = nil) {
@@ -94,6 +95,26 @@ class ChatManager: ObservableObject {
     /// Clears all messages from the conversation
     func clearChat() {
         messages.removeAll()
+        hasInitialResponse = false
+    }
+    
+    /// Sends the initial contextual prompt automatically when chat is first opened
+    func sendInitialPrompt(withContext context: String) {
+        guard !hasInitialResponse else { return }
+        
+        hasInitialResponse = true
+        isLoading = true
+        
+        // Create the initial contextual prompt
+        let initialPrompt = createContextualPrompt(
+            userMessage: "Can you give me some feedback on my journal entry?", 
+            journalEntry: context
+        )
+        
+        // Send to AI provider without adding user message to chat
+        Task {
+            await sendToAIProvider(initialPrompt, provider: selectedProvider, isInitialPrompt: true)
+        }
     }
     
     /// Sends a message to the selected AI provider
@@ -107,7 +128,6 @@ class ChatManager: ObservableObject {
         let fullContext = createContextualPrompt(userMessage: currentInput, journalEntry: context)
         
         // Clear input and set loading state
-        let messageToSend = currentInput
         currentInput = ""
         isLoading = true
         
@@ -137,7 +157,7 @@ class ChatManager: ObservableObject {
     }
     
     /// Sends the message to the appropriate AI provider's API
-    private func sendToAIProvider(_ message: String, provider: AIProvider) async {
+    private func sendToAIProvider(_ message: String, provider: AIProvider, isInitialPrompt: Bool = false) async {
         // Get API key from UserDefaults
         guard let apiKey = UserDefaults.standard.string(forKey: provider.keyName),
               !apiKey.isEmpty else {
@@ -159,7 +179,13 @@ class ChatManager: ObservableObject {
             }
             
             await MainActor.run {
-                addMessage(response, isUser: false, provider: provider)
+                if isInitialPrompt {
+                    // For initial prompt, add a contextual introduction
+                    addMessage("Here are my thoughts on your journal entry:", isUser: false, provider: provider)
+                    addMessage(response, isUser: false, provider: provider)
+                } else {
+                    addMessage(response, isUser: false, provider: provider)
+                }
                 isLoading = false
             }
         } catch {
@@ -739,7 +765,6 @@ struct ContentView: View {
     @State private var viewHeight: CGFloat = 0
     
     var body: some View {
-        let buttonBackground = colorScheme == .light ? Color.white : Color.black
         let navHeight: CGFloat = 68
         let textColor = colorScheme == .light ? Color.gray : Color.gray.opacity(0.8)
         let textHoverColor = colorScheme == .light ? Color.black : Color.white
@@ -747,6 +772,26 @@ struct ContentView: View {
         // Get the current screen width to calculate 1/3 for chat sidebar
         GeometryReader { geometry in
             HStack(spacing: 0) {
+                // Chat Sidebar - appears on the left, taking up 1/3 of screen width
+                if showingChatSidebar {
+                    ChatSidebarView(
+                        chatManager: chatManager, 
+                        text: text, 
+                        colorScheme: colorScheme,
+                        onClose: {
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                showingChatSidebar = false
+                            }
+                        },
+                        onAPIKeySetup: { provider in
+                            providerNeedingSetup = provider
+                            showingAPIKeySetup = true
+                        }
+                    )
+                    .frame(width: geometry.size.width / 3)
+                    .transition(.move(edge: .leading))
+                }
+                
                 // Main content area - takes up remaining space when chat is open
                 ZStack {
                 Color(colorScheme == .light ? .white : .black)
@@ -774,7 +819,7 @@ struct ContentView: View {
                     
           
                     .id("\(selectedFont)-\(fontSize)-\(colorScheme)")
-                    .padding(.bottom, bottomNavOpacity > 0 ? navHeight : 0)
+                    .padding(.bottom, (bottomNavOpacity > 0 && !showingChatSidebar) ? navHeight : 0)
                     .ignoresSafeArea()
                     .colorScheme(colorScheme)
                     .onAppear {
@@ -998,6 +1043,10 @@ struct ContentView: View {
                                 } else {
                                     // Toggle the chat sidebar with smooth animation
                                     withAnimation(.easeInOut(duration: 0.3)) {
+                                        // Close history sidebar if it's open
+                                        if showingChatSidebar == false {
+                                            showingSidebar = false
+                                        }
                                         showingChatSidebar.toggle()
                                     }
                                 }
@@ -1109,14 +1158,14 @@ struct ContentView: View {
                     }
                     .padding()
                     .background(Color(colorScheme == .light ? .white : .black))
-                    .opacity(bottomNavOpacity)
+                    .opacity(showingChatSidebar ? 0.0 : bottomNavOpacity)
                     .onHover { hovering in
                         isHoveringBottomNav = hovering
-                        if hovering {
+                        if hovering && !showingChatSidebar {
                             withAnimation(.easeOut(duration: 0.2)) {
                                 bottomNavOpacity = 1.0
                             }
-                        } else if timerIsRunning {
+                        } else if timerIsRunning && !showingChatSidebar {
                             withAnimation(.easeIn(duration: 1.0)) {
                                 bottomNavOpacity = 0.0
                             }
@@ -1273,25 +1322,7 @@ struct ContentView: View {
                 .background(Color(colorScheme == .light ? .white : NSColor.black))
             }
             
-            // Chat Sidebar - appears on the left, taking up 1/3 of screen width
-            if showingChatSidebar {
-                ChatSidebarView(
-                    chatManager: chatManager, 
-                    text: text, 
-                    colorScheme: colorScheme,
-                    onClose: {
-                        withAnimation(.easeInOut(duration: 0.3)) {
-                            showingChatSidebar = false
-                        }
-                    },
-                    onAPIKeySetup: { provider in
-                        providerNeedingSetup = provider
-                        showingAPIKeySetup = true
-                    }
-                )
-                .frame(width: geometry.size.width / 3)
-                .transition(.move(edge: .leading))
-            }
+
         }
         .frame(minWidth: 1100, minHeight: 600)
         .animation(.easeInOut(duration: 0.2), value: showingSidebar)
@@ -1302,6 +1333,11 @@ struct ContentView: View {
                 APIKeySetupView(provider: provider) {
                     showingAPIKeySetup = false
                     providerNeedingSetup = nil
+                    
+                    // Send initial prompt if chat is open and we have content
+                    if showingChatSidebar && !chatManager.hasInitialResponse && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        chatManager.sendInitialPrompt(withContext: text)
+                    }
                 }
             }
         }
@@ -1687,12 +1723,14 @@ struct ChatSidebarView: View {
     let onClose: () -> Void
     let onAPIKeySetup: (AIProvider) -> Void
     
+    @State private var inputHeight: CGFloat = 36
+    
     var body: some View {
         VStack(spacing: 0) {
             // Header with provider selector and close button
             HStack {
                 Text("AI Chat")
-                    .font(.headline)
+                    .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(colorScheme == .light ? .primary : .white)
                 
                 Spacer()
@@ -1706,11 +1744,19 @@ struct ChatSidebarView: View {
                 }
                 .pickerStyle(MenuPickerStyle())
                 .frame(maxWidth: 120)
+                .accentColor(colorScheme == .light ? .primary : .white)
                 
                 Button(action: onClose) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(colorScheme == .light ? .secondary : .gray)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(colorScheme == .light ? .secondary : .secondary.opacity(0.8))
+                        .frame(width: 24, height: 24)
+                        .background(
+                            Circle()
+                                .fill(colorScheme == .light ? 
+                                     Color.black.opacity(0.05) : 
+                                     Color.white.opacity(0.1))
+                        )
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering in
@@ -1721,9 +1767,11 @@ struct ChatSidebarView: View {
                     }
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .background(colorScheme == .light ? Color.gray.opacity(0.1) : Color.black.opacity(0.3))
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .background(colorScheme == .light ? 
+                       Color(.controlBackgroundColor) : 
+                       Color(.controlBackgroundColor).opacity(0.5))
             
             Divider()
             
@@ -1731,33 +1779,25 @@ struct ChatSidebarView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
-                        if chatManager.messages.isEmpty {
+                        if chatManager.messages.isEmpty && !chatManager.isLoading {
                             // Welcome message explaining the feature
                             VStack(alignment: .leading, spacing: 8) {
-                                Text("Welcome to AI Chat!")
+                                Text("AI Chat")
                                     .font(.headline)
                                     .foregroundColor(colorScheme == .light ? .primary : .white)
                                 
-                                Text("Your journal entry has been loaded as context. Ask questions, seek insights, or simply discuss your thoughts with AI.")
+                                Text("Getting AI insights on your journal entry...")
                                     .font(.body)
                                     .foregroundColor(colorScheme == .light ? .secondary : .gray)
                                     .fixedSize(horizontal: false, vertical: true)
                                 
-                                                if !hasAPIKey(for: chatManager.selectedProvider) {
-                    Button("Set up \(chatManager.selectedProvider.displayName) API Key") {
-                        onAPIKeySetup(chatManager.selectedProvider)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, 8)
-                } else {
-                    Button("Test API Connection") {
-                        Task {
-                            await testAPIConnection()
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .padding(.top, 8)
-                }
+                                if !hasAPIKey(for: chatManager.selectedProvider) {
+                                    Button("Set up \(chatManager.selectedProvider.displayName) API Key") {
+                                        onAPIKeySetup(chatManager.selectedProvider)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .padding(.top, 8)
+                                }
                             }
                             .padding(16)
                         } else {
@@ -1817,41 +1857,94 @@ struct ChatSidebarView: View {
                             chatManager.clearChat()
                         }
                         .buttonStyle(.plain)
-                        .foregroundColor(.secondary)
-                        .font(.caption)
+                        .foregroundColor(colorScheme == .light ? .secondary : .secondary.opacity(0.8))
+                        .font(.system(size: 12, weight: .medium))
                         
                         Spacer()
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 12)
                 }
                 
-                // Message input field
-                HStack(spacing: 8) {
-                    TextField("Ask about your journal entry...", text: $chatManager.currentInput, axis: .vertical)
-                        .textFieldStyle(.roundedBorder)
-                        .lineLimit(1...4)
-                        .onSubmit {
-                            sendMessage()
+                                // Message input field with enhanced styling
+                VStack(spacing: 0) {
+                    // Input container with border and theming
+                    HStack(alignment: .bottom, spacing: 12) {
+                        // Multi-line text input that expands
+                        ZStack(alignment: .topLeading) {
+                            // Background with theme-matching styling
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(colorScheme == .light ? 
+                                     Color(.controlBackgroundColor) : 
+                                     Color(.controlBackgroundColor).opacity(0.8))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .stroke(colorScheme == .light ? 
+                                               Color.black.opacity(0.1) : 
+                                               Color.white.opacity(0.2), lineWidth: 1)
+                                )
+                            
+                            // Text editor with proper styling
+                            TextEditor(text: $chatManager.currentInput)
+                                .font(.system(size: 14))
+                                .foregroundColor(colorScheme == .light ? .primary : .white)
+                                .scrollContentBackground(.hidden)
+                                .background(Color.clear)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .frame(height: inputHeight)
+                                .onChange(of: chatManager.currentInput) { _ in
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        inputHeight = calculateTextHeight()
+                                    }
+                                }
+                                .onSubmit {
+                                    sendMessage()
+                                }
+                            
+                            // Placeholder text
+                            if chatManager.currentInput.isEmpty {
+                                Text("Ask about your journal entry...")
+                                    .font(.system(size: 14))
+                                    .foregroundColor(colorScheme == .light ? .secondary : .secondary.opacity(0.8))
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 14)
+                                    .allowsHitTesting(false)
+                            }
                         }
+                        
+                        // Send button with improved styling
+                        Button(action: sendMessage) {
+                            Image(systemName: "paperplane.fill")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundColor(canSendMessage ? .white : .secondary)
+                                .frame(width: 36, height: 36)
+                                .background(
+                                    Circle()
+                                        .fill(canSendMessage ? 
+                                             (colorScheme == .light ? Color.black : Color.white) : 
+                                             Color.secondary.opacity(0.3))
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canSendMessage)
+                        .onHover { hovering in
+                            if hovering && canSendMessage {
+                                NSCursor.pointingHand.push()
+                            } else {
+                                NSCursor.pop()
+                            }
+                        }
+                    }
                     
-                    Button(action: sendMessage) {
-                        Image(systemName: "paperplane.fill")
-                            .font(.system(size: 14))
-                            .foregroundColor(canSendMessage ? .accentColor : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSendMessage)
-                    .onHover { hovering in
-                        if hovering && canSendMessage {
-                            NSCursor.pointingHand.push()
-                        } else {
-                            NSCursor.pop()
-                        }
-                    }
+                    // Subtle separator line to match history section
+                    Rectangle()
+                        .fill(colorScheme == .light ? Color.gray.opacity(0.2) : Color.gray.opacity(0.4))
+                        .frame(height: 1)
+                        .padding(.top, 12)
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 16)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
             }
         }
         .background(colorScheme == .light ? Color.white : Color.black)
@@ -1859,12 +1952,18 @@ struct ChatSidebarView: View {
             // Check if API key is available for the selected provider
             if !hasAPIKey(for: chatManager.selectedProvider) {
                 onAPIKeySetup(chatManager.selectedProvider)
+            } else if !chatManager.hasInitialResponse && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Automatically send initial prompt if we have API key and journal content
+                chatManager.sendInitialPrompt(withContext: text)
             }
         }
         .onChange(of: chatManager.selectedProvider) { provider in
             // Check API key when provider changes
             if !hasAPIKey(for: provider) {
                 onAPIKeySetup(provider)
+            } else if !chatManager.hasInitialResponse && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Send initial prompt if we have API key and haven't sent it yet
+                chatManager.sendInitialPrompt(withContext: text)
             }
         }
     }
@@ -1888,116 +1987,21 @@ struct ChatSidebarView: View {
         chatManager.sendMessage(withContext: text)
     }
     
-    /// Tests the API connection with a simple message
-    private func testAPIConnection() async {
-        guard let apiKey = UserDefaults.standard.string(forKey: chatManager.selectedProvider.keyName) else {
-            chatManager.addMessage("No API key found for \(chatManager.selectedProvider.displayName)", isUser: false)
-            return
-        }
+    /// Calculates the dynamic height needed for the text input based on content
+    private func calculateTextHeight() -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 14)
+        let lineHeight = font.ascender - font.descender + font.leading
         
-        chatManager.addMessage("Testing API connection...", isUser: true)
+        // Count the number of lines in the current input
+        let lineCount = max(1, chatManager.currentInput.components(separatedBy: .newlines).count)
         
-        do {
-            let response: String
-            switch chatManager.selectedProvider {
-            case .chatGPT:
-                response = try await callOpenAIAPITest(apiKey: apiKey)
-            case .claude:
-                response = try await callAnthropicAPITest(apiKey: apiKey)
-            }
-            
-            await MainActor.run {
-                chatManager.addMessage("✅ Connection successful! Response: \(response)", isUser: false, provider: chatManager.selectedProvider)
-            }
-        } catch {
-            await MainActor.run {
-                chatManager.addMessage("❌ Connection failed: \(error.localizedDescription)", isUser: false, provider: chatManager.selectedProvider)
-            }
-        }
+        // Calculate height: base padding (16) + (line count * line height)
+        let calculatedHeight = 16 + (CGFloat(lineCount) * lineHeight)
+        
+        // Ensure minimum height of 36 and maximum of 120
+        return max(36, min(calculatedHeight, 120))
     }
-    
-    /// Simple test call to OpenAI API
-    private func callOpenAIAPITest(apiKey: String) async throws -> String {
-        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
-            throw APIError.invalidURL
-        }
-        
-        let payload: [String: Any] = [
-            "model": "gpt-4o-mini",
-            "messages": [
-                ["role": "user", "content": "Hello! Just testing the connection. Please respond with 'Connection successful!'"]
-            ],
-            "max_tokens": 50,
-            "temperature": 0.7
-        ]
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw APIError.requestFailed("No HTTP response received")
-        }
-        
-        guard httpResponse.statusCode == 200 else {
-            throw APIError.requestFailed("HTTP \(httpResponse.statusCode)")
-        }
-        
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let firstChoice = choices.first,
-              let message = firstChoice["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw APIError.invalidResponse
-        }
-        
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    
-    /// Simple test call to Anthropic API
-    private func callAnthropicAPITest(apiKey: String) async throws -> String {
-        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
-            throw APIError.invalidURL
-        }
-        
-        let payload: [String: Any] = [
-            "model": "claude-3-haiku-20240307",
-            "max_tokens": 50,
-            "messages": [
-                ["role": "user", "content": "Hello! Just testing the connection. Please respond with 'Connection successful!'"]
-            ]
-        ]
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw APIError.requestFailed("No HTTP response received")
-        }
-        
-        guard httpResponse.statusCode == 200 else {
-            throw APIError.requestFailed("HTTP \(httpResponse.statusCode)")
-        }
-        
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let firstContent = content.first,
-              let text = firstContent["text"] as? String else {
-            throw APIError.invalidResponse
-        }
-        
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
+
 }
 
 /// Displays individual chat messages with appropriate styling
@@ -2012,12 +2016,12 @@ struct ChatMessageView: View {
                 
                 VStack(alignment: .trailing, spacing: 4) {
                     Text(message.content)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(Color.accentColor)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                        .frame(maxWidth: .infinity * 0.8, alignment: .trailing)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(colorScheme == .light ? Color.black : Color.white)
+                        .foregroundColor(colorScheme == .light ? .white : .black)
+                        .cornerRadius(16)
+                        .frame(maxWidth: .infinity * 0.75, alignment: .trailing)
                     
                     Text(formatTime(message.timestamp))
                         .font(.caption2)
@@ -2042,12 +2046,14 @@ struct ChatMessageView: View {
                     }
                     
                     Text(message.content)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(colorScheme == .light ? Color.gray.opacity(0.15) : Color.white.opacity(0.15))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(colorScheme == .light ? 
+                                   Color(.controlBackgroundColor) : 
+                                   Color.white.opacity(0.1))
                         .foregroundColor(colorScheme == .light ? .primary : .white)
-                        .cornerRadius(12)
-                        .frame(maxWidth: .infinity * 0.8, alignment: .leading)
+                        .cornerRadius(16)
+                        .frame(maxWidth: .infinity * 0.75, alignment: .leading)
                         .textSelection(.enabled) // Allow text selection for AI responses
                 }
                 
